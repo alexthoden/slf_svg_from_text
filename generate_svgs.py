@@ -310,6 +310,18 @@ def _points_to_svg_path(path_points: List[tuple]) -> str:
     return path_d
 
 
+def _strip_close_path_commands(path_d: str) -> str:
+    """
+    Remove close path commands (Z or z) from SVG path string to keep paths open.
+    Also cleans up unnecessary whitespace and formatting.
+    """
+    # Remove Z or z commands (close path)
+    path_d = re.sub(r'\s*[Zz]\s*', '', path_d)
+    # Clean up extra spaces
+    path_d = re.sub(r'\s+', ' ', path_d).strip()
+    return path_d
+
+
 def potrace_with_fallback(
     bin_img: Image.Image,
     turdsize: int,
@@ -364,7 +376,7 @@ def _try_potrace(
         
         bin_img.save(pbm_path)
         
-        # Run potrace
+        # Run potrace (no -i flag to generate open paths instead of closed fills)
         cmd = [
             potrace_exe,
             "-s",  # Smooth
@@ -372,7 +384,7 @@ def _try_potrace(
             f"--opttolerance={opttolerance}",
             f"--alphamax={alphamax}",
             "-o", svg_path,
-            "-i",
+            # "-i", # Uncomment to remove border. Note this seems to be the issue with open-path generation
             pbm_path,
         ]
         
@@ -389,6 +401,8 @@ def _try_potrace(
         
         for path_elem in root.findall(".//svg:path", ns):
             d = path_elem.get("d", "")
+            # Remove close path commands (Z or z) to keep paths open
+            d = _strip_close_path_commands(d)
             if len(d) > 20:
                 paths.append(d)
         
