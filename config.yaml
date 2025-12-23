@@ -11,22 +11,22 @@ canvas:
 line_styles:
   recipient_name:
     font_path: "fonts/Hey Beauty.otf"
-    size_pt: 16
+    size_pt: 20
     spacing_mm: 8          # vertical spacing to next line
     letter_spacing_px: 0   # extra spacing between glyphs (pixels at canvas dpi)
   address_line1:
     font_path: "fonts/CambriaMath.ttf"
-    size_pt: 12
+    size_pt: 13
     spacing_mm: 6
     letter_spacing_px: 0
   address_line2:
     font_path: "fonts/CambriaMath.ttf"
-    size_pt: 12
+    size_pt: 13
     spacing_mm: 6
     letter_spacing_px: 0
   city_state_zip:
     font_path: "fonts/CambriaMath.ttf"
-    size_pt: 12
+    size_pt: 13
     spacing_mm: 0
     letter_spacing_px: 0
 
@@ -45,6 +45,6 @@ output:
 #           0.0 = corners, higher = more rounded
 potrace:
   turdsize: 0        # Keep all stroke details
-  opttolerance: 0.5  # Balanced curve smoothing
-  alphamax: 1      # Good balance for stroke intersections
+  opttolerance: 0.4  # Balanced curve smoothing
+  alphamax: 0        # Good balance for stroke intersections
 

@@ -18,6 +18,7 @@ import time
 from scipy.ndimage import binary_opening, binary_closing, binary_dilation, label, maximum_filter
 import xml.etree.ElementTree as ET
 import re
+from scipy.spatial import distance
 
 def measure_path_height(d_list):
     ys = []
@@ -177,29 +178,18 @@ def skeletonize_binary_image(img: Image.Image) -> Image.Image:
     """
     Take a grayscale (L) or 1-bit image of text,
     binarize it cleanly, denoise it, and produce a 1-pixel skeleton (centerline).
-    
-    Key insight: For stroke centerline extraction, we need:
-    1. Proper binarization that doesn't cut through strokes
-    2. Standard skeletonize to extract true centerlines
-    3. Minimal post-processing to avoid breaking continuity
     """
     # Convert to grayscale array
     gray = np.array(img.convert("L"), dtype=np.uint8)
 
-    # 1) Binarization: Use standard threshold
-    # The key is to use a threshold that captures the main stroke body
-    # without including anti-aliasing halos around edges.
-    # A threshold around 128 works well for most fonts at 600 DPI.
-    binary = gray > 128
+    # 1) Binarization: threshold at 128
+    binary = gray > 10
 
     # 2) Clean noise: remove tiny specks / fill small gaps
-    # Use MINIMAL morphology - only close obvious gaps and remove noise
     binary = binary_opening(binary, structure=np.ones((2, 2)))
     binary = binary_closing(binary, structure=np.ones((2, 2)))
 
     # 3) Skeletonize to get the centerline
-    # Standard skeletonization provides true 1-pixel wide centerlines
-    # through the middle of each stroke, which is exactly what we want.
     skel = skeletonize(binary)
 
     # Convert back to PIL 1-bit image (0/255)
@@ -207,6 +197,233 @@ def skeletonize_binary_image(img: Image.Image) -> Image.Image:
     skel_img.save("debug_skel_recipient.png")
 
     return skel_img
+
+
+def _simplify_and_smooth_path(path_points: List[tuple], opttolerance: float, alphamax: float) -> str:
+    """
+    Simplify and smooth a path using Ramer-Douglas-Peucker algorithm.
+    Falls back to direct pixel representation if simplification fails.
+    
+    Args:
+        path_points: List of (y, x) tuples from skeleton tracing
+        opttolerance: Simplification tolerance (0.2-1.0, higher = more aggressive)
+        alphamax: Corner detection threshold
+    
+    Returns:
+        SVG path string (either simplified or direct pixel representation)
+    """
+    try:
+        if len(path_points) < 3:
+            # Too few points, use direct representation
+            return _points_to_svg_path(path_points)
+        
+        # Convert to (x, y) for distance calculation
+        xy_points = np.array([(px, py) for py, px in path_points])
+        
+        # Apply Ramer-Douglas-Peucker simplification
+        simplified = _rdp_simplify(xy_points, opttolerance)
+        
+        if len(simplified) < 2:
+            # Simplification too aggressive, fall back
+            return _points_to_svg_path(path_points)
+        
+        # Convert back to (y, x) tuples
+        simplified_points = [(y, x) for x, y in simplified]
+        
+        # Build SVG path with Line commands
+        if len(simplified_points) > 0:
+            path_d = f"M{simplified_points[0][1]},{simplified_points[0][0]}"
+            for py, px in simplified_points[1:]:
+                path_d += f"L{px},{py}"
+            return path_d
+        else:
+            return ""
+    
+    except Exception as e:
+        log_stage(f"Curve fitting failed ({e}), falling back to direct pixel representation")
+        return _points_to_svg_path(path_points)
+
+
+def _rdp_simplify(points: np.ndarray, tolerance: float) -> np.ndarray:
+    """
+    Ramer-Douglas-Peucker path simplification algorithm.
+    Reduces number of points while maintaining path shape.
+    """
+    if len(points) < 3:
+        return points
+    
+    # Find point with maximum distance from line
+    dmax = 0
+    index = 0
+    start = points[0]
+    end = points[-1]
+    
+    # Vector from start to end
+    line_vec = end - start
+    line_len = np.linalg.norm(line_vec)
+    
+    if line_len < 1e-10:
+        # Start and end are the same, return them
+        return np.array([start, end])
+    
+    line_unitvec = line_vec / line_len
+    
+    for i in range(1, len(points) - 1):
+        point = points[i]
+        # Vector from start to point
+        point_vec = point - start
+        # Project onto line
+        proj_length = np.dot(point_vec, line_unitvec)
+        proj = start + proj_length * line_unitvec
+        # Distance from point to line
+        dist = np.linalg.norm(point - proj)
+        
+        if dist > dmax:
+            dmax = dist
+            index = i
+    
+    # If max distance is greater than tolerance, recursively simplify
+    if dmax > tolerance:
+        # Recursive call
+        rec1 = _rdp_simplify(points[:index + 1], tolerance)
+        rec2 = _rdp_simplify(points[index:], tolerance)
+        # Build result, avoiding duplicating the middle point
+        result = np.vstack([rec1[:-1], rec2])
+    else:
+        # Just return start and end
+        result = np.array([start, end])
+    
+    return result
+
+
+def _points_to_svg_path(path_points: List[tuple]) -> str:
+    """
+    Convert path points directly to SVG path string (no simplification).
+    Fallback when curve fitting fails.
+    """
+    if len(path_points) < 1:
+        return ""
+    
+    path_d = f"M{path_points[0][1]},{path_points[0][0]}"
+    for py, px in path_points[1:]:
+        path_d += f"L{px},{py}"
+    return path_d
+
+
+def potrace_with_fallback(
+    bin_img: Image.Image,
+    turdsize: int,
+    opttolerance: float,
+    alphamax: float,
+    line_label: str = "",
+) -> List[str]:
+    """
+    Attempt to use potrace binary for vectorization, fall back to custom path tracing.
+    
+    Args:
+        bin_img: Binary skeleton image
+        turdsize: Potrace turdsize parameter
+        opttolerance: Curve fitting tolerance
+        alphamax: Corner detection threshold
+        line_label: Label for logging
+    
+    Returns:
+        List of SVG path strings
+    """
+    log_stage(f"Skeleton-to-path conversion for line: {line_label}")
+    
+    # Try potrace first
+    potrace_path = "bin/potrace.exe"
+    if os.path.exists(potrace_path):
+        try:
+            return _try_potrace(bin_img, potrace_path, turdsize, opttolerance, alphamax, line_label)
+        except Exception as e:
+            log_stage(f"Potrace failed ({e}), falling back to custom path tracing")
+    else:
+        log_stage(f"Potrace not found at {potrace_path}, using custom path tracing")
+    
+    # Fallback: use custom path tracing
+    return _custom_path_tracing(bin_img, opttolerance, alphamax, line_label)
+
+
+def _try_potrace(
+    bin_img: Image.Image,
+    potrace_exe: str,
+    turdsize: int,
+    opttolerance: float,
+    alphamax: float,
+    line_label: str,
+) -> List[str]:
+    """
+    Use potrace binary to vectorize skeleton.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Save skeleton as PBM
+        pbm_path = os.path.join(tmpdir, "skeleton.pbm")
+        svg_path = os.path.join(tmpdir, "skeleton.svg")
+        
+        bin_img.save(pbm_path)
+        
+        # Run potrace
+        cmd = [
+            potrace_exe,
+            "-s",  # Smooth
+            f"--turdsize={turdsize}",
+            f"--opttolerance={opttolerance}",
+            f"--alphamax={alphamax}",
+            "-o", svg_path,
+            "-i",
+            pbm_path,
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Potrace failed: {result.stderr}")
+        
+        # Parse SVG output
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        
+        paths = []
+        ns = {"svg": "http://www.w3.org/2000/svg"}
+        
+        for path_elem in root.findall(".//svg:path", ns):
+            d = path_elem.get("d", "")
+            if len(d) > 20:
+                paths.append(d)
+        
+        log_stage(f"Potrace vectorization successful for line: {line_label} ({len(paths)} paths)")
+        return paths
+
+
+def _custom_path_tracing(
+    bin_img: Image.Image,
+    opttolerance: float,
+    alphamax: float,
+    line_label: str,
+) -> List[str]:
+    """
+    Use custom smart path tracing to vectorize skeleton.
+    """
+    # Convert binary image to array
+    skel = np.array(bin_img.convert("L"), dtype=np.uint8) > 128
+    
+    paths = []
+    
+    if np.sum(skel) > 0:
+        # Label connected components in skeleton
+        from scipy.ndimage import label as label_components
+        labeled, num_features = label_components(skel)
+        
+        # For each connected component, create an SVG path
+        for component_id in range(1, num_features + 1):
+            component = (labeled == component_id)
+            path_d = _trace_component_to_svg(component, opttolerance, alphamax)
+            if len(path_d) > 20:
+                paths.append(path_d)
+    
+    log_stage(f"Custom path tracing completed for line: {line_label} ({len(paths)} paths)")
+    return paths
 
 
 def potrace_bitmap_to_svg_paths(
@@ -217,64 +434,133 @@ def potrace_bitmap_to_svg_paths(
     line_label: str = "",
 ) -> List[str]:
     """
-    Vectorize a binary skeleton image into SVG paths using Potrace.
-    Expects a clean 1-bit image (mode "1") as input.
-    
-    Parameters are tuned to avoid artifacts at intersection points:
-    - Lower turdsize: keeps small strokes (important for intersections)
-    - Moderate opttolerance: balances curve smoothing with geometry preservation
-    - Adjusted alphamax: controls corner sharpness (lower = sharper, better for overlaps)
+    Main entry point for skeleton-to-path conversion.
+    Uses potrace with fallback to custom path tracing.
     """
-    log_stage(f"Potrace starting for line: {line_label}")
+    return potrace_with_fallback(bin_img, turdsize, opttolerance, alphamax, line_label)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        pbm_path = os.path.join(tmpdir, "input.pbm")
-        svg_path = os.path.join(tmpdir, "output.svg")
 
-        # Ensure 1-bit, then save as PBM (Pillow infers from extension)
-        pbm_img = bin_img.convert("1")
-        pbm_img.save(pbm_path)
-
-        potrace_exe = os.path.join(os.path.dirname(__file__), "bin", "potrace.exe")
+def _find_endpoints(component: np.ndarray) -> List[tuple]:
+    """
+    Find endpoints (pixels with only 1 neighbor) in skeleton component.
+    These are good starting points for path tracing.
+    """
+    endpoints = []
+    pixels = np.argwhere(component)
+    
+    for py, px in pixels:
+        neighbors = []
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = py + dy, px + dx
+                if 0 <= ny < component.shape[0] and 0 <= nx < component.shape[1]:
+                    if component[ny, nx]:
+                        neighbors.append((ny, nx))
         
-        # Use optimized parameters:
-        # - turdsize: 0 keeps ALL small features (essential for correct overlaps)
-        # - opttolerance: 0.4 provides good curve smoothing without losing detail
-        # - alphamax: 0.8 preserves corners better at intersections
-        cmd = [
-            potrace_exe,
-            os.path.abspath(pbm_path),         # INPUT bitmap
-            "-s",
-            "-o", os.path.abspath(svg_path),   # OUTPUT SVG
-            "-i",
-            "--turdsize", str(turdsize),
-            "--opttolerance", str(opttolerance),
-            "--alphamax", str(alphamax),
-        ]
+        # Endpoint has only 1 neighbor
+        if len(neighbors) == 1:
+            endpoints.append((py, px))
+    
+    return endpoints
 
-        log_stage(f"Running command: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        print("[Potrace stdout]", result.stdout)
-        print("[Potrace stderr]", result.stderr)
 
-        # Parse SVG and extract all path 'd' attributes
-        tree = ET.parse(svg_path)
-        root = tree.getroot()
-        nsmap = {"svg": "http://www.w3.org/2000/svg"}
-        paths = [elem.attrib["d"] for elem in root.findall(".//svg:path", nsmap)]
+def _get_direction_vector(prev_pos: tuple, curr_pos: tuple) -> tuple:
+    """
+    Calculate direction vector from previous to current position.
+    """
+    py, px = curr_pos
+    ppy, ppx = prev_pos
+    dy = py - ppy
+    dx = px - ppx
+    norm = np.sqrt(dy**2 + dx**2)
+    if norm == 0:
+        return (0, 0)
+    return (dy / norm, dx / norm)
+
+
+def _select_next_neighbor(neighbors: List[tuple], curr_pos: tuple, prev_pos: tuple) -> tuple:
+    """
+    Select next neighbor based on direction continuity (choose neighbor closest to current direction).
+    """
+    if not neighbors:
+        return None
+    
+    if len(neighbors) == 1:
+        return neighbors[0]
+    
+    # Current direction
+    curr_dir = _get_direction_vector(prev_pos, curr_pos)
+    
+    # Find neighbor that continues the direction best
+    best_neighbor = None
+    best_dot = -2.0
+    
+    for neighbor in neighbors:
+        neighbor_dir = _get_direction_vector(curr_pos, neighbor)
+        dot_product = curr_dir[0] * neighbor_dir[0] + curr_dir[1] * neighbor_dir[1]
+        if dot_product > best_dot:
+            best_dot = dot_product
+            best_neighbor = neighbor
+    
+    return best_neighbor
+
+
+def _trace_component_to_svg(component: np.ndarray, opttolerance: float, alphamax: float) -> str:
+    """
+    Trace a single connected component (skeleton) to an SVG path string using smart path following.
+    Detects endpoints and traces intelligently by following direction continuity.
+    """
+    pixels_set = set(map(tuple, np.argwhere(component)))
+    
+    if len(pixels_set) == 0:
+        return ""
+    
+    # Find endpoints or use any pixel if no clear endpoints
+    endpoints = _find_endpoints(component)
+    start_pixel = endpoints[0] if endpoints else list(pixels_set)[0]
+    
+    # Trace from start point
+    path_points = [start_pixel]
+    visited = {start_pixel}
+    current = start_pixel
+    
+    while len(visited) < len(pixels_set):
+        py, px = current
+        neighbors = []
         
-        # Post-process: filter out very small paths that might be artifacts
-        # These can occur at intersection points due to pixelation
-        paths = [p for p in paths if len(p) > 20]  # Keep only meaningful paths
-
-    log_stage(f"Potrace completed for line: {line_label}")
-    return paths
+        # Get all unvisited neighbors
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = py + dy, px + dx
+                if (ny, nx) in pixels_set and (ny, nx) not in visited:
+                    neighbors.append((ny, nx))
+        
+        if not neighbors:
+            break
+        
+        # Choose next neighbor based on direction continuity
+        if len(path_points) >= 2:
+            next_pos = _select_next_neighbor(neighbors, current, path_points[-2])
+        else:
+            next_pos = neighbors[0]
+        
+        if next_pos is None:
+            next_pos = neighbors[0]
+        
+        visited.add(next_pos)
+        path_points.append(next_pos)
+        current = next_pos
+    
+    # Convert to SVG path
+    if len(path_points) > 1:
+        smoothed_path = _simplify_and_smooth_path(path_points, opttolerance, alphamax)
+        return smoothed_path
+    
+    return ""
 
 
 
@@ -342,7 +628,7 @@ def assemble_svg(
 
     # --- 2. Compute total height dynamically ---
     total_height = 0
-    spacing_factor = 0.80  # 20% extra spacing
+    spacing_factor = 0.95  # 20% extra spacing
 
     for width, height in line_bounds:
         total_height += height * spacing_factor
@@ -371,7 +657,7 @@ def assemble_svg(
         # Center horizontally
         x_offset = (svg_width - width) / 2
 
-        # Flip vertically and position
+        # Position without flip (skeleton is already correctly oriented)
         g = dwg.g(
             transform=(
                 f"translate({x_offset},{current_y}) "
